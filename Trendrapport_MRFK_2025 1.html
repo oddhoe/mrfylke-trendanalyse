@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trendanalyse Møre og Romsdal</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background-color: #fff; padding: 30px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-radius: 8px; }
+        h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; margin-bottom: 20px; }
+        h2 { color: #34495e; margin-top: 40px; }
+        
+        .button-group { margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap; }
+        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 1em; font-weight: 500; transition: all 0.3s; }
+        .btn-primary { background-color: #27ae60; color: white; }
+        .btn-primary:hover { background-color: #229954; }
+        
+        .summary-cards { display: flex; gap: 20px; margin-bottom: 40px; flex-wrap: wrap; }
+        .card { flex: 1; background: #ecf0f1; padding: 20px; border-radius: 8px; min-width: 200px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .card h3 { margin: 0 0 10px 0; font-size: 1.1em; color: #7f8c8d; }
+        .card .value { font-size: 2em; font-weight: bold; color: #2c3e50; }
+        .card .sub-text { font-size: 0.9em; color: #7f8c8d; margin-top: 5px; }
+        
+        .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 40px; }
+        .chart-container { background: #fff; padding: 15px; border: 1px solid #eee; border-radius: 8px; height: 400px; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #3498db; color: white; }
+        tr:hover { background-color: #f1f1f1; }
+        
+        .status-badge { padding: 5px 10px; border-radius: 15px; font-size: 0.85em; font-weight: bold; }
+        .status-good { background-color: #d5f5e3; color: #1e8449; }
+        .status-bad { background-color: #fadbd8; color: #c0392b; }
+
+        /* PDF-spesifikk styling */
+        @media print {
+            body { background-color: white; padding: 0; }
+            .container { box-shadow: none; max-width: 100%; }
+            .button-group { display: none; }
+            .charts-grid { grid-template-columns: 1fr; }
+            .chart-container { page-break-inside: avoid; }
+            h2 { page-break-before: avoid; }
+            table { page-break-inside: avoid; }
+        }
+
+        @media (max-width: 768px) {
+            .charts-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>ViaPPS Trendanalyse: Møre og Romsdal Fylkeskommune (Fylke 15)</h1>
+    
+    <p>Analyse av spor og jevnhet. Målet for total kjørelengde er estimert til <strong>6 000 km</strong>.</p>
+
+    <!-- Summary Cards -->
+    <div class="summary-cards">
+        <div class="card">
+            <h3 id="card1-title">Siste Målt Lengde</h3>
+            <div class="value" id="card1-value">-</div>
+            <div class="sub-text" id="card1-sub">Henter data...</div>
+        </div>
+        <div class="card">
+            <h3 id="card2-title">Antall Filer</h3>
+            <div class="value" id="card2-value">-</div>
+            <div class="sub-text">Antall datafiler godkjent</div>
+        </div>
+        <div class="card">
+            <h3>Andel Dårlig Vei</h3>
+            <div class="value" id="card3-value" style="color: #c0392b;">-</div>
+            <div class="sub-text" id="card3-sub">Dekketilstand</div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="charts-grid">
+        <div class="chart-container">
+            <canvas id="coverageChart"></canvas>
+        </div>
+        <div class="chart-container">
+            <canvas id="conditionChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Data Table -->
+    <h2>Detaljert Datarapport</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>År</th>
+                <th>Filer</th>
+                <th>Målt Lengde (km)</th>
+                <th>Dekningsgrad (av 6200 km)</th>
+                <th>Tilfredsstillende (%)</th>
+                <th>Dårlig / Svært Dårlig (%)</th>
+            </tr>
+        </thead>
+        <tbody id="tableBody">
+            <!-- Data populated by JS -->
+        </tbody>
+    </table>
+</div>
+
+<!-- 1. LAST INN DATA FILEN FØRST -->
+<script>
+// DATA BAKT INN AUTOMATISK (02.12.2025)
+// data.js
+const reportData = [
+    { 
+        year: 2020, 
+        files: 545,       // Beregnet: 73% dekning
+        km: 4384.21,      // Beregnet: 73% av 6000 km
+        good: 66.6,       // 100 - 33.4
+        bad: 33.4         // Kilde: SSB bilde
+    },
+    { 
+        year: 2021, 
+        files: 699,       // Beregnet: 95.8% dekning
+        km: 5900.06,      // Beregnet: 95.8% av 6000 km
+        good: 64.6,       // 100 - 35.4
+        bad: 35.4         // Kilde: SSB bilde
+    },
+    { 
+        year: 2022, 
+        files: 731,       // Estimert
+        km: 6020.68,      // Estimert
+        good: 63.5,       // 100 - 36.5
+        bad: 36.5         // Kilde: SSB bilde
+    },
+    { 
+        year: 2023, 
+        files: 714,       // Faktisk
+        km: 6023.86,      // Faktisk
+        good: 63.0,       // 100 - 37.0
+        bad: 37.0         // Kilde: SSB bilde
+    },
+    { 
+        year: 2024, 
+        files: 751,       // Faktisk
+        km: 5960.98,      // Faktisk
+        good: 63.1,       // 100 - 36.9
+        bad: 36.9         // Kilde: SSB bilde
+    },
+    { 
+        year: 2025, 
+        files: 750,       // Faktisk fra filanalyse
+        km: 5987.08,      // Faktisk fra filanalyse
+        good: 62.8,       // Fra filanalyse
+        bad: 37.2         // Fra filanalyse
+    }
+];
+
+</script>
+
+<script>
+    // --- KONFIGURASJON ---
+    const targetKm = 6200;
+    
+    // Sjekk om data er lastet
+    if (typeof reportData === 'undefined') {
+        document.querySelector('.container').innerHTML = '<h2 style="color:red">Feil: Fant ikke data.js. Sjekk at filen ligger i samme mappe.</h2>';
+        throw new Error("Data missing");
+    }
+
+    const data = reportData;
+    
+    // 1. FINN SISTE ÅR (AUTOMATISK)
+    const latest = data[data.length - 1];
+    const prev = data.length > 1 ? data[data.length - 2] : latest;
+
+    // 2. OPPDATER SUMMARY CARDS
+    document.getElementById('card1-title').innerText = `Siste Målt Lengde (${latest.year})`;
+    document.getElementById('card1-value').innerText = latest.km.toLocaleString(undefined, {maximumFractionDigits: 0}) + " km";
+    
+    const kmDiff = latest.km - prev.km;
+    let trendText = kmDiff > 100 ? "▲ Økning fra i fjor" : (kmDiff < -100 ? "▼ Nedgang fra i fjor" : "▬ Stabilt nivå");
+    document.getElementById('card1-sub').innerText = trendText;
+
+    document.getElementById('card2-title').innerText = `Antall Filer (${latest.year})`;
+    document.getElementById('card2-value').innerText = latest.files;
+
+    document.getElementById('card3-value').innerText = latest.bad + "%";
+    const badDiff = latest.bad - prev.bad;
+    let badTrend = badDiff > 1.0 ? "▲ Forverring" : (badDiff < -1.0 ? "▼ Forbedring" : "▬ Stabilt");
+    document.getElementById('card3-sub').innerText = badTrend;
+
+    // 3. POPULER TABELL
+    const tbody = document.getElementById('tableBody');
+    [...data].sort((a, b) => b.year - a.year).forEach(row => {
+        const coverage = ((row.km / targetKm) * 100).toFixed(1);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td><strong>${row.year}</strong></td>
+            <td>${row.files}</td>
+            <td>${row.km.toLocaleString(undefined, {minimumFractionDigits: 1, maximumFractionDigits: 1})}</td>
+            <td>
+                <div style="background:#e0e0e0; border-radius:4px; width:80px; height:10px; display:inline-block; margin-right:5px;">
+                    <div style="background:${coverage > 90 ? '#27ae60' : '#f1c40f'}; width:${Math.min(coverage, 100)}%; height:100%; border-radius:4px;"></div>
+                </div>
+                ${coverage}%
+            </td>
+            <td><span class="status-badge status-good">${row.good}%</span></td>
+            <td><span class="status-badge status-bad">${row.bad}%</span></td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    // 4. DIAGRAMMER (CHARTS)
+    
+    // Chart 1: Coverage
+    new Chart(document.getElementById('coverageChart').getContext('2d'), {
+        type: 'bar',
+        data: {
+            labels: data.map(d => d.year),
+            datasets: [
+                {
+                    label: 'Målt Lengde (km)',
+                    data: data.map(d => d.km),
+                    backgroundColor: 'rgba(52, 152, 219, 0.7)',
+                    borderColor: 'rgba(52, 152, 219, 1)',
+                    borderWidth: 1
+                },
+                {
+                    label: 'Mål (6200 km)',
+                    data: data.map(() => targetKm),
+                    type: 'line',
+                    borderColor: '#e74c3c',
+                    borderWidth: 2,
+                    borderDash: [5, 5],
+                    pointRadius: 0,
+                    fill: false
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Utvikling i målt veilengde' }
+            },
+            scales: {
+                y: { 
+                    beginAtZero: false, 
+                    min: 4000,
+                    title: { display: true, text: 'Kilometer' } 
+                }
+            }
+        }
+    });
+
+    // Chart 2: Condition
+    new Chart(document.getElementById('conditionChart').getContext('2d'), {
+        type: 'line',
+        data: {
+            labels: data.map(d => d.year),
+            datasets: [
+                {
+                    label: 'Tilfredsstillende (%)',
+                    data: data.map(d => d.good),
+                    borderColor: '#27ae60',
+                    backgroundColor: 'rgba(39, 174, 96, 0.1)',
+                    borderWidth: 3,
+                    fill: true,
+                    tension: 0.3
+                },
+                {
+                    label: 'Dårlig / Svært Dårlig (%)',
+                    data: data.map(d => d.bad),
+                    borderColor: '#c0392b',
+                    backgroundColor: 'rgba(192, 57, 43, 0.1)',
+                    borderWidth: 3,
+                    fill: true,
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                title: { display: true, text: 'Kvalitetsutvikling (SSB/KOSTRA)' }
+            },
+            scales: {
+                y: { min: 0, max: 100, title: { display: true, text: 'Prosentandel' } }
+            }
+        }
+    });
+    
+</script>
+
+</body>
+</html>
