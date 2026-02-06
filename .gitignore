@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.vscode/
+.venv/
+
+# ArcGIS / geodata
+*.gdb/
+*.gdb/*
+*.gdb.zip
+*.lock
+*.lyrx
+*.sde
+*.apr
+
+# Logs / temp
+*.log
+tmp/
+temp/

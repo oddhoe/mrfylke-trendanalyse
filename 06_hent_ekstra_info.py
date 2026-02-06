@@ -1,136 +1,187 @@
-# 06_hent_ekstra_info_FIXED.py
-# ✅ FIXED: Henter nå VEGLENKESEKV_ID og posisjon slik at Skript 02 finner den!
+# 06_hent_ekstra_info.py
+#
+# Henter høydebegrensninger fra NVDB (objekt 591)
+# Bruker:
+#   - Beregnet høyde (10247) som primær
+#   - Skilta høyde (5277) som fallback
+# Filtrerer: kun høyder < 4.5 m
+#
+# Output:
+#   Hoydebegrensning_LAV
 
-import arcpy
-import requests
+from __future__ import annotations
+
 import os
+import requests
+import arcpy
+from typing import Optional
+
+# -------------------------
+# KONFIG
+# -------------------------
+FYLKE = 15
+SRID = 5973
+
+NVDB_API = "https://nvdbapiles.atlas.vegvesen.no"
+VEGOBJ_API = f"{NVDB_API}/vegobjekter/api/v4"
+
+HOYDE_OBJEKT_ID = 591
+MAX_HOYDE_M = 4.5
+
+GDB = r"D:\Conda\Flaskehalser\gdb\nvdb_radata.gdb"
+OUT_FC = os.path.join(GDB, "Hoydebegrensning_LAV")
+
+HEADERS = {
+    "X-Client": "nvdb_script",
+    "Accept": "application/vnd.vegvesen.nvdb-v3-rev1+json",
+}
 
 arcpy.env.overwriteOutput = True
 
-# --- KONFIGURASJON ---
 
-GDB = r"D:\Conda\Flaskehalser\gdb\nvdb_radata.gdb"
-FYLKE = 15  # Møre og Romsdal
-OBJEKTTYPE = 591  # Høydebegrensning
-VEG_KAT = "FV"  # Fylkesvei
+# -------------------------
+# HJELP
+# -------------------------
+def log(msg: str) -> None:
+    print(msg)
 
-BASE_URL = f"https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/{OBJEKTTYPE}"
 
-HEADERS = {
-    "X-Client": "FlaskehalsAnalyse_Script",
-    "Accept": "application/vnd.vegvesen.nvdb-v3+json"
-}
+def iter_paged(url: str, params: dict):
+    offset: Optional[str] = None
+    while True:
+        p = dict(params)
+        if offset:
+            p["start"] = offset
 
-START_PARAMS = {
-    "fylke": FYLKE,
-    "vegsystemreferanse": VEG_KAT,
-    "inkluder": "egenskaper,lokasjon,geometri",
-    "srid": 5973,
-    "alle_versjoner": "false"
-}
+        r = requests.get(url, params=p, headers=HEADERS, timeout=30)
+        r.raise_for_status()
 
-OUT_FC = os.path.join(GDB, f"Hoydebegrensning_{OBJEKTTYPE}")
-
-def hent_alle_objekter():
-    url = BASE_URL
-    current_params = START_PARAMS
-    objekter = []
-    
-    print(f"Starter nedlasting av objekttype {OBJEKTTYPE}...")
-    
-    while url:
-        if len(objekter) > 0 and len(objekter) % 100 == 0:
-            print(f" ... {len(objekter)} lastet ned.")
-        
-        try:
-            r = requests.get(url, params=current_params, headers=HEADERS, timeout=30)
-            if r.status_code != 200:
-                print(f"Feil: {r.status_code}")
-                break
-            
-            data = r.json()
-            nye = data.get("objekter", [])
-            
-            if not nye: break
-            
-            objekter.extend(nye)
-            
-            neste = data.get("metadata", {}).get("neste", {})
-            url = neste.get("href")
-            current_params = {}
-        
-        except Exception as e:
-            print(f"Error: {e}")
+        data = r.json()
+        objs = data.get("objekter", [])
+        if not objs:
             break
-    
-    print(f"Totalt {len(objekter)} objekter funnet.")
-    return objekter
 
-def lagre_til_gdb(objekter):
-    if not objekter: return
-    
-    print(f"Lagrer til {OUT_FC}...")
+        for o in objs:
+            yield o
+
+        nxt = data.get("metadata", {}).get("neste")
+        if not nxt:
+            break
+        offset = nxt.get("start")
+
+
+def to_geometry(geom: dict) -> Optional[arcpy.Geometry]:
+    if not geom or "wkt" not in geom:
+        return None
+    try:
+        return arcpy.FromWKT(geom["wkt"], arcpy.SpatialReference(SRID))
+    except Exception:
+        return None
+
+
+def create_fc() -> None:
     if arcpy.Exists(OUT_FC):
         arcpy.management.Delete(OUT_FC)
-    
-    sr = arcpy.SpatialReference(25833)
-    arcpy.management.CreateFeatureclass(os.path.dirname(OUT_FC), os.path.basename(OUT_FC), "POINT", spatial_reference=sr)
-    
-    # Felter
-    arcpy.management.AddField(OUT_FC, "NVDB_ID", "LONG")
-    arcpy.management.AddField(OUT_FC, "SKILTET_HOYDE", "DOUBLE")
-    arcpy.management.AddField(OUT_FC, "TYPE_HINDER", "TEXT", field_length=50)
-    
-    # ✅ VIKTIG: Legger til koblingsnøkler for Skript 02
+
+    arcpy.management.CreateFeatureclass(
+        out_path=os.path.dirname(OUT_FC),
+        out_name=os.path.basename(OUT_FC),
+        geometry_type="POLYLINE",
+        spatial_reference=SRID,
+    )
+
     arcpy.management.AddField(OUT_FC, "VEGLENKESEKV_ID", "LONG")
     arcpy.management.AddField(OUT_FC, "STARTPOS", "DOUBLE")
     arcpy.management.AddField(OUT_FC, "SLUTTPOS", "DOUBLE")
-    
-    cols = ["SHAPE@", "NVDB_ID", "SKILTET_HOYDE", "TYPE_HINDER", "VEGLENKESEKV_ID", "STARTPOS", "SLUTTPOS"]
-    
-    with arcpy.da.InsertCursor(OUT_FC, cols) as cur:
-        count = 0
-        for o in objekter:
-            nvdb_id = o["id"]
-            
-            # 1. Hent Høyde
-            høyde = next((e["verdi"] for e in o.get("egenskaper", []) if e["id"] == 5277), None)
-            if not høyde: continue
-            
-            # 2. Hent Type
-            type_hinder = next((e["verdi"] for e in o.get("egenskaper", []) if e["id"] == 5270), "Ukjent")
-            
-            # 3. Hent Posisjon (ID)
-            stedfestinger = o.get("lokasjon", {}).get("stedfestinger", [])
-            vid = None
-            startpos = 0.0
-            sluttpos = 0.0
-            
-            # Vi tar den første gyldige stedfestingen på vegnettet
-            for s in stedfestinger:
-                if s.get("veglenkesekvensid"):
-                    vid = int(s["veglenkesekvensid"])
-                    startpos = float(s.get("startposisjon", 0))
-                    sluttpos = float(s.get("sluttposisjon", startpos)) # Punkt har ofte start=slutt
-                    break
-            
-            if not vid: continue # Hopp over hvis vi ikke finner veglenke-kobling
-            
-            # 4. Geometri
-            wkt = o.get("geometri", {}).get("wkt")
-            if not wkt: continue
-            
-            try:
-                pt_geom = arcpy.FromWKT(wkt, sr)
-                if pt_geom.type != 'point': pt_geom = pt_geom.centroid
-                
-                cur.insertRow((pt_geom, nvdb_id, høyde, type_hinder, vid, startpos, sluttpos))
-                count += 1
-            except:
-                pass
-                
-    print(f"✅ Suksess! Lagret {count} høydebegrensninger med ID-kobling.")
+    arcpy.management.AddField(OUT_FC, "MIN_HOYDE", "DOUBLE")
+    arcpy.management.AddField(OUT_FC, "KILDE", "TEXT", field_length=30)
 
+
+def extract_hoyde(egenskaper: list) -> Optional[float]:
+    """
+    Prioritet:
+      1) Beregnet høyde (10247)
+      2) Skilta høyde (5277)
+    """
+    beregnet: Optional[float] = None
+    skiltet: Optional[float] = None
+
+    for e in egenskaper:
+        eid = e.get("id")
+        val = e.get("verdi")
+
+        if val is None:
+            continue
+
+        if eid == 10247:  # Beregnet høyde
+            try:
+                beregnet = float(val)
+            except ValueError:
+                pass
+
+        elif eid == 5277:  # Skilta høyde
+            try:
+                skiltet = float(val)
+            except ValueError:
+                pass
+
+    return beregnet if beregnet is not None else skiltet
+
+
+# -------------------------
+# HOVEDLOGIKK
+# -------------------------
+def hent_hoydebegrensninger() -> None:
+    log("Henter høydebegrensninger (objekt 591)…")
+    create_fc()
+
+    url = f"{VEGOBJ_API}/vegobjekter/{HOYDE_OBJEKT_ID}"
+    params = {
+        "fylke": FYLKE,
+        "antall": 1000,
+        "inkluder": "egenskaper,lokasjon,geometri",
+    }
+
+    count: int = 0
+
+    with arcpy.da.InsertCursor(
+        OUT_FC,
+        ["SHAPE@", "VEGLENKESEKV_ID", "STARTPOS", "SLUTTPOS", "MIN_HOYDE", "KILDE"],
+    ) as cur:
+
+        for obj in iter_paged(url, params):
+            hoyde = extract_hoyde(obj.get("egenskaper", []))
+
+            # Kun høyder < 4.5 m
+            if hoyde is None or hoyde >= MAX_HOYDE_M:
+                continue
+
+            geom = to_geometry(obj.get("geometri"))
+            if geom is None:
+                continue
+
+            for s in obj.get("lokasjon", {}).get("stedfestinger", []):
+                vid = s.get("veglenkesekvensid")
+                if vid is None:
+                    continue
+
+                cur.insertRow(
+                    (
+                        geom,
+                        int(vid),
+                        float(s.get("startposisjon", 0.0)),
+                        float(s.get("sluttposisjon", 0.0)),
+                        hoyde,
+                        "Beregnet" if hoyde == extract_hoyde(obj.get("egenskaper", [])) else "Skilta",
+                    )
+                )
+                count += 1
+
+    log(f"✅ Ferdig: {count} høydebegrensninger < {MAX_HOYDE_M} m")
+
+
+# -------------------------
+# MAIN
+# -------------------------
 if __name__ == "__main__":
-    objs = hent_alle_objekter()
-    lagre_til_gdb(objs)
+    hent_hoydebegrensninger()
