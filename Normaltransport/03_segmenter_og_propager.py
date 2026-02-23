@@ -11,7 +11,7 @@ import os
 arcpy.env.overwriteOutput = True
 
 # --- GDB / FC ---
-GDB = r"G:\Test\Prosjekt_2025\FlaskerUtenhals\gdb\nvdb_radata.gdb"
+GDB = r"D:\Conda\Flaskehasler_git\mrfylke-trendanalyse\Normaltransport\gdb\nvdb_radata.gdb"
 IN_FC = os.path.join(GDB, "Veg_TillatProfil")
 
 OUT_SEG_FC = os.path.join(GDB, "Veg_TillatSegmentert")   # segmenter (samme geometri som IN)
