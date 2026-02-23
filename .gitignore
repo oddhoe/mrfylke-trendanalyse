@@ -1,0 +1,10 @@
+﻿# Ignore everything by default
+*
+
+# But keep Python source and this ignore file
+!*.py
+!.gitignore
+
+# Common Python junk (belts & suspenders)
+__pycache__/
+*.pyc
