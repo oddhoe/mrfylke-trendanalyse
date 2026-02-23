@@ -1,10 +1,15 @@
 ﻿# Ignore everything by default
 *
 
-# But keep Python source and this ignore file
+# Allow directories
+!*/
+
+# Allow Python source
 !*.py
+
+# Keep ignore file
 !.gitignore
 
-# Common Python junk (belts & suspenders)
+# Python junk
 __pycache__/
 *.pyc
