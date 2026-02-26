@@ -1,308 +1,553 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Kjørelogg FV Møre og Romsdal – bygg vegnettlag (K og G) til GPKG
+Kjørelogg 2026 – FV vegnett (K og G) + registreringsnett (propagering/dissolve)
+ROBUST og deterministisk init av Status_Måling = "IKKE MÅLT" for ALLE rader.
 
-- Henter segmenterte veglenkesekvenser fra NVDB Les API v4 (vegnett)
-- Filtrerer til vegkategori F (Fylkesveg) og fylke=15
-- Splitter på trafikantgruppe K (kjørende) og G (gående/syklende)
-- Legger på feltene du trenger (status, måledato, operatør, bil, kommentar, driftskontrakt)
-- Skriver til GeoPackage med to lag: fv_k og fv_g
+Bygger 2 nivå:
+1) Detaljvegnett (segmentert fra NVDB):  Vegnett_FV_K  / Vegnett_FV_G
+2) Registreringsnett (propagert):       Regnett_FV_K   / Regnett_FV_G
+   - Dissolve på (TRAFIKANTGRP, VEGKATEGORI, VEGNUMMER, Driftskontrakt)
+   - Median av segmentlengde i gruppa legges på som Lengde_km_median
 
-Kilde/endepunkt: https://nvdbapiles.atlas.vegvesen.no/vegnett/api/v4/veglenkesekvenser  (NVDB API Les v4, vegnett)  :contentReference[oaicite:1]{index=1}
+Inkluderer:
+- MR (fylke=15) FV
+- Vestland FV61 i Stad kommune 4649 (Bryggja-området)
+
+Krever: ArcGIS Pro Python (arcpy), requests
 """
 
 from __future__ import annotations
 
-import argparse
-import datetime as dt
-import json
-import sys
+import os
 import time
-from typing import Dict, Any, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional
 
+import arcpy
 import requests
 
-# Prøv å bruke shapely+fiona for GPKG-skriving
-try:
-    from shapely import wkt as shapely_wkt
-    import fiona
-    from fiona.crs import from_epsg
-except Exception as e:
-    shapely_wkt = None
-    fiona = None
-    from_epsg = None
+arcpy.env.overwriteOutput = True
+
+# -------------------------
+# KONFIG
+# -------------------------
+NVDB_API = "https://nvdbapiles.atlas.vegvesen.no"
+VEGNETT_API = f"{NVDB_API}/vegnett/api/v4"
+
+OUT_FOLDER = r"G:\Test\2026\Output"
+OUT_GDB = os.path.join(OUT_FOLDER, "Kjorelogg_2026.gdb")
+
+# Driftskontrakt (fra din gpkg)
+DRIFTSKONTRAKT_GPKG = r"G:\Test\2026\Ansvarsområder.gpkg"
+DRIFTSKONTRAKT_LAYER = "main.Driftskontraksområder"
+KONTRAKT_FELT = "Kontraksområde"
+
+# NVDB-geometri
+SRID = 5973
+SR = arcpy.SpatialReference(SRID)
+
+# MR
+MR_FYLKE = 15
+VEGSYSTEMREF_MR = "F"  # fungerer i ditt v904-skript
+
+# Vestland tillegg: FV61 i Stad kommune 4649
+VL_FYLKE = 46
+VL_KOMM = 4649
+VEGSYSTEMREF_VL = "Fv61"
+
+HEADERS = {
+    "X-Client": "mrfk_kjorelogg_2026",
+    "Accept": "application/vnd.vegvesen.nvdb-v3+json",
+}
+TIMEOUT = 60
 
 
-NVDB_BASE = "https://nvdbapiles.atlas.vegvesen.no"
-VEGNETT_URL = f"{NVDB_BASE}/vegnett/api/v4/veglenkesekvenser"
+# -------------------------
+# LOGG
+# -------------------------
+def log(msg: str) -> None:
+    print(msg)
 
 
-STATUS_DOMAIN = ["Ikke målt", "Påbegynt", "Måles ikke", "Ferdig målt"]
+# -------------------------
+# HTTP + paging
+# -------------------------
+def create_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
 
 
-def nvdb_get(url: str, params: Dict[str, Any], timeout: int = 60) -> Dict[str, Any]:
-    headers = {
-        "Accept": "application/json",
-        # Greit å identifisere klienten ved feilsøking hos SVV, men ikke påkrevd
-        "User-Agent": "mrfk-kjorelogg-fv/1.0",
-    }
-    r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
-def is_fylkesveg(obj: Dict[str, Any]) -> bool:
-    # V4-respons har vegsystemreferanse.vegsystem.vegkategori (f.eks "F")
-    try:
-        return obj["vegsystemreferanse"]["vegsystem"]["vegkategori"] == "F"
-    except Exception:
-        return False
-
-
-def trafikantgruppe(obj: Dict[str, Any]) -> Optional[str]:
-    # Typisk ligger denne på vegsystemreferanse.strekning.trafikantgruppe ("K", "G", ...)
-    try:
-        return obj["vegsystemreferanse"]["strekning"]["trafikantgruppe"]
-    except Exception:
-        return None
-
-
-def iter_veglenkesekvenser(
-    fylke: int,
-    antall: int = 1000,
-    sortert: bool = False,
-    inkluder_antall: bool = False,
-    ekstra_params: Optional[Dict[str, Any]] = None,
-    sleep_s: float = 0.0,
+def iter_paged(
+    session: requests.Session,
+    url: str,
+    params: Dict[str, Any],
+    *,
+    label: str,
+    max_pages: int = 200_000,
+    max_retries: int = 5,
+    retry_backoff: float = 2.0,
 ) -> Iterable[Dict[str, Any]]:
-    """
-    Generator som paginerer gjennom vegnett/api/v4/veglenkesekvenser.
-    Paginering i v4: metadata.neste.start (og evt metadata.neste.href). :contentReference[oaicite:2]{index=2}
-    """
-    start = None
-    params = {
-        "fylke": fylke,
-        "antall": antall,
-        "sortert": str(sortert).lower(),
-        "inkluderAntall": str(inkluder_antall).lower(),
-        # merk: "start" settes etter første side
-    }
-    if ekstra_params:
-        params.update(ekstra_params)
-
+    start: Optional[str] = None
+    seen_starts: set[str] = set()
+    seen_hrefs: set[str] = set()
     page = 0
+    next_url = url
+
     while True:
-        if start:
-            params["start"] = start
-        else:
-            params.pop("start", None)
-
         page += 1
-        data = nvdb_get(VEGNETT_URL, params=params)
+        if page > max_pages:
+            raise RuntimeError(f"{label}: Stoppet etter {max_pages} sider (sikkerhetsbryter).")
 
-        objekter = data.get("objekter") or []
-        for o in objekter:
-            yield o
+        p = dict(params)
+        if start:
+            p["start"] = start
 
-        meta = data.get("metadata") or {}
-        neste = meta.get("neste") or {}
-        start = neste.get("start")
+        r = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = session.get(next_url, params=p, timeout=TIMEOUT)
+                if r.status_code == 200:
+                    break
+                wait = retry_backoff * (2 ** (attempt - 1))
+                log(f"⚠️ [{label}] HTTP {r.status_code} (forsøk {attempt}/{max_retries}) — venter {wait:.0f}s...")
+                time.sleep(wait)
+            except requests.exceptions.ConnectionError as e:
+                wait = retry_backoff * (2 ** (attempt - 1))
+                log(f"⚠️ [{label}] Tilkoblingsfeil (forsøk {attempt}/{max_retries}): {e} — venter {wait:.0f}s...")
+                time.sleep(wait)
 
-        if not start:
-            break
+        if r is None or r.status_code != 200:
+            status = r.status_code if r is not None else "N/A"
+            txt = r.text if r is not None else ""
+            raise RuntimeError(f"{label}: HTTP {status} etter {max_retries} forsøk. Svar: {txt[:800]}")
 
-        if sleep_s > 0:
-            time.sleep(sleep_s)
+        data = r.json()
+        objs = data.get("objekter", []) or []
+        if not objs:
+            return
+
+        yield from objs
+
+        nxt = (data.get("metadata") or {}).get("neste") or {}
+        nxt_start = nxt.get("start")
+        if nxt_start is not None:
+            nxt_start = str(nxt_start)
+            if nxt_start in seen_starts:
+                log(f"⚠️ {label}: neste.start repeteres ({nxt_start!r}). Avbryter.")
+                return
+            seen_starts.add(nxt_start)
+            start = nxt_start
+            continue
+
+        href = nxt.get("href")
+        if href:
+            if href in seen_hrefs:
+                log(f"⚠️ {label}: neste.href repeteres. Avbryter.")
+                return
+            seen_hrefs.add(href)
+            next_url = href
+            params = {}
+            start = None
+            continue
+
+        return
 
 
-def build_feature(
-    obj: Dict[str, Any],
-    default_status: str = "Ikke målt",
-) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """
-    Returnerer (properties, geometry_geojsonlike) for GPKG/GeoJSON-skriving.
-    NVDB geometri leveres som WKT + srid (typisk 5973 for vegnett). :contentReference[oaicite:3]{index=3}
-    """
-    geom = obj.get("geometri") or {}
+# -------------------------
+# Geometri
+# -------------------------
+def to_geometry(geom: Optional[Dict[str, Any]]):
+    if not geom:
+        return None
     wkt = geom.get("wkt")
-    srid = geom.get("srid")
-
     if not wkt:
         return None
+    try:
+        return arcpy.FromWKT(wkt, SR)
+    except Exception:
+        return None
 
-    tg = trafikantgruppe(obj)
-    vsr = obj.get("vegsystemreferanse") or {}
-    vegsys = (vsr.get("vegsystem") or {})
-    strek = (vsr.get("strekning") or {})
 
-    props = {
-        # NVDB-identifikatorer
-        "veglenkesekvensid": obj.get("veglenkesekvensid"),
-        "veglenkenummer": obj.get("veglenkenummer"),
-        "segmentnummer": obj.get("segmentnummer"),
-        "referanse": obj.get("referanse"),
-        "kortform": obj.get("kortform"),
+# -------------------------
+# GDB/FC
+# -------------------------
+def create_gdb(path: str) -> None:
+    folder, name = os.path.split(path)
+    os.makedirs(folder, exist_ok=True)
+    if arcpy.Exists(path):
+        arcpy.management.Delete(path)
+    arcpy.management.CreateFileGDB(folder, name)
 
-        # Vegsystemreferanse (nyttig i rapportering/søk)
-        "vegkategori": vegsys.get("vegkategori"),
-        "fase": vegsys.get("fase"),
-        "vegnummer": vegsys.get("nummer"),
-        "strekning": strek.get("strekning"),
-        "delstrekning": strek.get("delstrekning"),
-        "trafikantgruppe": tg,
-        "retning": strek.get("retning"),
-        "fra_meter": strek.get("fra_meter"),
-        "til_meter": strek.get("til_meter"),
 
-        # Nøkkeltall
-        "lengde_m": obj.get("lengde"),
+def create_fc(gdb: str, name: str, geom_type: str, extra_fields: list[tuple]) -> str:
+    fc = os.path.join(gdb, name)
+    if arcpy.Exists(fc):
+        arcpy.management.Delete(fc)
 
-        # Kjørelogg-felter (klare for domener/valglister i AGOL)
-        "status_maling": default_status,
-        "maledato": None,  # date
-        "malebiloper": None,
-        "malebil": None,
-        "kommentar_mbo": None,
-        "driftskontr": None,
+    arcpy.management.CreateFeatureclass(gdb, name, geom_type, spatial_reference=SR)
+
+    arcpy.management.AddField(fc, "VEGLENKESEKV_ID", "LONG")
+    arcpy.management.AddField(fc, "STARTPOS", "DOUBLE")
+    arcpy.management.AddField(fc, "SLUTTPOS", "DOUBLE")
+
+    for f in extra_fields:
+        if len(f) == 2:
+            arcpy.management.AddField(fc, f[0], f[1])
+        else:
+            arcpy.management.AddField(fc, f[0], f[1], field_length=f[2])
+
+    return fc
+
+
+# -------------------------
+# Kjøreloggfelter + domain + init status
+# -------------------------
+def legg_til_kjoreloggfelter(fc: str) -> None:
+    wanted = [
+        ("Status_Måling", "TEXT", 30),
+        ("Måledato", "DATE", None),
+        ("Målebiloperatør", "TEXT", 50),
+        ("Målebil", "TEXT", 50),
+        ("Kommentar_MBO", "TEXT", 255),
+        ("Driftskontrakt", "TEXT", 150),
+        ("Lengde_km", "DOUBLE", None),
+        ("KEY_DISS", "TEXT", 220),  # komposittnøkkel for median-join
+    ]
+    eksisterende = {f.name for f in arcpy.ListFields(fc)}
+    for navn, ftype, lengde in wanted:
+        if navn in eksisterende:
+            continue
+        if ftype == "TEXT" and lengde:
+            arcpy.management.AddField(fc, navn, ftype, field_length=lengde)
+        else:
+            arcpy.management.AddField(fc, navn, ftype)
+
+
+def setup_domain(gdb: str) -> None:
+    domain = "StatusMal_Domain"
+    domains = [d.name for d in arcpy.da.ListDomains(gdb)]
+    if domain not in domains:
+        arcpy.management.CreateDomain(gdb, domain, "Status måling", "TEXT", "CODED")
+        for v in ["IKKE MÅLT", "PÅBEGYNT", "MÅLES IKKE", "FERDIG MÅLT"]:
+            arcpy.management.AddCodedValueToDomain(gdb, domain, v, v)
+        log("✓ Domain opprettet")
+
+    arcpy.env.workspace = gdb
+    for fc in arcpy.ListFeatureClasses():
+        fnames = {f.name for f in arcpy.ListFields(fc)}
+        if "Status_Måling" in fnames:
+            arcpy.management.AssignDomainToField(fc, "Status_Måling", domain)
+
+
+def init_status_ikke_malt(fc: str) -> None:
+    fields = {f.name for f in arcpy.ListFields(fc)}
+    if "Status_Måling" not in fields:
+        return
+    arcpy.management.CalculateField(fc, "Status_Måling", "'IKKE MÅLT'", "PYTHON3")
+
+
+# -------------------------
+# Driftskontrakt
+# -------------------------
+def importer_driftskontrakt(gdb: str) -> str:
+    src = os.path.join(DRIFTSKONTRAKT_GPKG, DRIFTSKONTRAKT_LAYER)
+    if not arcpy.Exists(src):
+        raise RuntimeError(f"Fant ikke driftskontrakt-lag: {src}")
+    dst = os.path.join(gdb, "Driftskontrakt")
+    arcpy.conversion.FeatureClassToFeatureClass(src, gdb, "Driftskontrakt")
+    return dst
+
+
+def spatial_join_driftskontrakt(target_fc: str, drift_fc: str) -> str:
+    out_fc = target_fc + "_join"
+    arcpy.analysis.SpatialJoin(
+        target_features=target_fc,
+        join_features=drift_fc,
+        out_feature_class=out_fc,
+        join_operation="JOIN_ONE_TO_ONE",
+        join_type="KEEP_ALL",
+        match_option="INTERSECT",
+    )
+    arcpy.management.Delete(target_fc)
+    arcpy.management.Rename(out_fc, target_fc)
+    return target_fc
+
+
+def calc_driftskontrakt(target_fc: str) -> None:
+    fields = {f.name for f in arcpy.ListFields(target_fc)}
+    if KONTRAKT_FELT not in fields:
+        raise RuntimeError(
+            f"Finner ikke felt '{KONTRAKT_FELT}' etter join. "
+            "Sjekk at polygonlaget har feltet og at SpatialJoin treffer."
+        )
+    arcpy.management.CalculateField(target_fc, "Driftskontrakt", f"!{KONTRAKT_FELT}!", "PYTHON3")
+
+
+# -------------------------
+# Lengde
+# -------------------------
+def beregn_lengde_km(fc: str) -> None:
+    # ArcPy parameter: Coordinate_System (stor C/S)
+    arcpy.management.AddGeometryAttributes(
+        fc,
+        "LENGTH_GEODESIC",
+        "KILOMETERS",
+        Coordinate_System=SR,
+    )
+    fields = [f.name for f in arcpy.ListFields(fc)]
+    src_field = "LENGTH_GEODESIC" if "LENGTH_GEODESIC" in fields else ("LENGTHGEODESIC" if "LENGTHGEODESIC" in fields else None)
+    if src_field:
+        if "Lengde_km" in fields:
+            arcpy.management.CalculateField(fc, "Lengde_km", f"!{src_field}!", "PYTHON3")
+        else:
+            arcpy.management.AlterField(fc, src_field, "Lengde_km", "Lengde_km")
+
+
+# -------------------------
+# KEY for dissolve/median
+# -------------------------
+def calc_key_diss(fc: str) -> None:
+    fields = {f.name for f in arcpy.ListFields(fc)}
+    if not {"TRAFIKANTGRP", "VEGKATEGORI", "VEGNUMMER", "Driftskontrakt", "KEY_DISS"} <= fields:
+        raise RuntimeError("Mangler felt for KEY_DISS. Har du kjørt legg_til_kjoreloggfelter + join drift?")
+
+    expr = (
+        "!TRAFIKANTGRP! + '|' + str(!VEGKATEGORI!) + '|' + str(!VEGNUMMER!) + '|' + "
+        "(str(!Driftskontrakt!) if !Driftskontrakt! else '')"
+    )
+    arcpy.management.CalculateField(fc, "KEY_DISS", expr, "PYTHON3")
+
+
+# -------------------------
+# 1) VEGNETT – segmentert fra NVDB
+# -------------------------
+def hent_vegnett_segmentert(
+    session: requests.Session,
+    gdb: str,
+    *,
+    out_name: str,
+    fylke: int,
+    vegsystemref: str,
+    trafikantgruppe: str,
+    kommune: Optional[int] = None,
+) -> str:
+    fc = create_fc(
+        gdb,
+        out_name,
+        "POLYLINE",
+        [
+            ("TRAFIKANTGRP", "TEXT", 1),
+            ("VEGKATEGORI", "TEXT", 1),
+            ("VEGNUMMER", "LONG"),
+            ("VEGREF", "TEXT", 50),
+            ("KOMMUNE", "TEXT", 60),
+            ("FYLKE_NAVN", "TEXT", 40),
+        ],
+    )
+
+    url = f"{VEGNETT_API}/veglenkesekvenser/segmentert"
+    params: Dict[str, Any] = {
+        "fylke": fylke,
+        "vegsystemreferanse": vegsystemref,
+        "antall": 5000,
+        "inkluderAntall": "false",
+        "srid": SRID,
     }
+    if kommune is not None:
+        params["kommune"] = kommune
 
-    # GeoJSON-lignende geometri for fiona: shapely -> mapping
-    if shapely_wkt is None:
-        raise RuntimeError("Mangler shapely. Installer: pip install shapely fiona")
+    cols = [
+        "SHAPE@",
+        "VEGLENKESEKV_ID",
+        "STARTPOS",
+        "SLUTTPOS",
+        "TRAFIKANTGRP",
+        "VEGKATEGORI",
+        "VEGNUMMER",
+        "VEGREF",
+        "KOMMUNE",
+        "FYLKE_NAVN",
+    ]
 
-    g = shapely_wkt.loads(wkt)
-    geometry = {
-        "type": g.geom_type,
-        "coordinates": getattr(g, "__geo_interface__", {}).get("coordinates", None),
-    }
-    if geometry["coordinates"] is None:
-        geometry = g.__geo_interface__
-
-    # CRS håndteres i layer-oppsett; vi returnerer srid for sanity-check
-    props["_srid"] = srid
-    return props, geometry
-
-
-def ensure_status(value: str) -> str:
-    if value not in STATUS_DOMAIN:
-        raise ValueError(f"Ugyldig status '{value}'. Må være en av: {STATUS_DOMAIN}")
-    return value
-
-
-def write_gpkg(
-    out_path: str,
-    layer_name: str,
-    features: Iterable[Tuple[Dict[str, Any], Dict[str, Any]]],
-    epsg: int = 5973,
-) -> int:
-    """
-    Skriver features til GeoPackage-lag.
-    """
-    if fiona is None:
-        raise RuntimeError("Mangler fiona. Installer: pip install fiona shapely")
-
-    schema = {
-        "geometry": "LineString",
-        "properties": {
-            "veglenkesekvensid": "int",
-            "veglenkenummer": "int",
-            "segmentnummer": "int",
-            "referanse": "str",
-            "kortform": "str",
-            "vegkategori": "str",
-            "fase": "str",
-            "vegnummer": "int",
-            "strekning": "int",
-            "delstrekning": "int",
-            "trafikantgruppe": "str",
-            "retning": "str",
-            "fra_meter": "float",
-            "til_meter": "float",
-            "lengde_m": "float",
-            "status_maling": "str",
-            "maledato": "date",
-            "malebiloper": "str",
-            "malebil": "str",
-            "kommentar_mbo": "str",
-            "driftskontr": "str",
-            "_srid": "int",
-        },
-    }
-
-    # NB: geometrytype kan variere (MultiLineString). Vi skriver som "Unknown" hvis nødvendig:
-    # For enkelhet: åpne først med LineString og la fiona håndtere MultiLineString ved behov.
-    count = 0
-    with fiona.open(
-        out_path,
-        mode="w" if layer_name == "fv_k" else "a",
-        driver="GPKG",
-        layer=layer_name,
-        schema=schema,
-        crs=from_epsg(epsg),
-    ) as dst:
-        for props, geom in features:
-            dst.write({"type": "Feature", "properties": props, "geometry": geom})
-            count += 1
-    return count
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fylke", type=int, default=15, help="Fylkesnummer (Møre og Romsdal=15)")
-    ap.add_argument("--out", required=True, help="Output .gpkg fil, f.eks G:\\Test\\kjorelogg_fv_mr.gpkg")
-    ap.add_argument("--epsg", type=int, default=5973, help="EPSG for vegnettgeometri (default 5973)")
-    ap.add_argument("--antall", type=int, default=1000, help="Sidestørrelse mot API")
-    ap.add_argument("--sleep", type=float, default=0.0, help="Pause (sek) mellom sider")
-    ap.add_argument("--default-status", default="Ikke målt", help="Standard statusverdi")
-    args = ap.parse_args()
-
-    default_status = ensure_status(args.default_status)
-
-    # Samle og splitte features på trafikantgruppe
-    def gen_filtered(tg_wanted: str):
-        for obj in iter_veglenkesekvenser(
-            fylke=args.fylke,
-            antall=args.antall,
-            sortert=False,
-            inkluder_antall=False,
-            ekstra_params=None,
-            sleep_s=args.sleep,
-        ):
-            if not is_fylkesveg(obj):
+    cnt = 0
+    with arcpy.da.InsertCursor(fc, cols) as cur:
+        for seg in iter_paged(session, url, params, label=f"vegnett_{out_name}"):
+            vr = seg.get("vegsystemreferanse", {}) or {}
+            tg = (vr.get("strekning", {}) or {}).get("trafikantgruppe")
+            if tg != trafikantgruppe:
                 continue
 
-            tg = trafikantgruppe(obj)
-            if tg != tg_wanted:
+            geom = to_geometry(seg.get("geometri"))
+            if not geom:
                 continue
 
-            built = build_feature(obj, default_status=default_status)
-            if built is None:
-                continue
+            vs = vr.get("vegsystem", {}) or {}
+            stre = vr.get("strekning", {}) or {}
 
-            yield built
+            vegref = None
+            if vs.get("vegkategori") and vs.get("nummer"):
+                vegref = f"{vs['vegkategori']}V{vs['nummer']}"
+                if stre.get("strekning") and stre.get("delstrekning"):
+                    vegref += f" S{stre['strekning']}D{stre['delstrekning']}"
 
-    print(f"[{dt.datetime.now().isoformat(timespec='seconds')}] Henter FV (fylke={args.fylke}) og skriver GPKG...")
-    print("  - Layer fv_k: trafikantgruppe=K")
-    n_k = write_gpkg(args.out, "fv_k", gen_filtered("K"), epsg=args.epsg)
+            loc = seg.get("lokasjon") or {}
+            kommune_s = str(loc["kommuner"][0]) if loc.get("kommuner") else None
+            fylke_s = str(loc["fylker"][0]) if loc.get("fylker") else None
 
-    print("  - Layer fv_g: trafikantgruppe=G")
-    n_g = write_gpkg(args.out, "fv_g", gen_filtered("G"), epsg=args.epsg)
+            cur.insertRow(
+                (
+                    geom,
+                    int(seg["veglenkesekvensid"]),
+                    float(seg.get("startposisjon", 0.0)),
+                    float(seg.get("sluttposisjon", 0.0)),
+                    tg,
+                    vs.get("vegkategori"),
+                    vs.get("nummer"),
+                    vegref,
+                    kommune_s,
+                    fylke_s,
+                )
+            )
+            cnt += 1
 
-    print(f"Ferdig. Skrev {n_k} features i fv_k og {n_g} features i fv_g.")
-    print(f"Output: {args.out}")
+    log(f"✓ {out_name}: {cnt} segmenter")
+    return fc
 
-    # Liten sanity: minner om domener i AGOL
-    print("\nNeste steg i ArcGIS Online (kort):")
-    print("1) Publiser .gpkg som Hosted Feature Layer (to lag).")
-    print("2) Sett 'Status måling' som coded value domain:")
-    print("   " + " | ".join(STATUS_DOMAIN))
-    print("3) Symboliser på status_maling.")
-    print("4) Driftskontrakt: bruk 'Select by Location' eller spatial join mot kontraktspolygoner.")
-    return 0
+
+# -------------------------
+# 2) REGNETT – dissolve + median
+# -------------------------
+def lag_regnett_med_median(gdb: str, in_fc: str, out_name: str) -> str:
+    out_fc = os.path.join(gdb, out_name)
+
+    # Sørg for lengde på segmenter
+    beregn_lengde_km(in_fc)
+
+    # Key for grouping
+    calc_key_diss(in_fc)
+
+    # Median-tabell pr KEY_DISS
+    stats_tbl = os.path.join(gdb, f"tbl_median_{out_name}")
+    if arcpy.Exists(stats_tbl):
+        arcpy.management.Delete(stats_tbl)
+
+    arcpy.analysis.Statistics(
+        in_table=in_fc,
+        out_table=stats_tbl,
+        statistics_fields=[["Lengde_km", "MEDIAN"]],
+        case_field=["KEY_DISS"],
+    )
+
+    # Dissolve geometri
+    if arcpy.Exists(out_fc):
+        arcpy.management.Delete(out_fc)
+
+    dissolve_fields = ["TRAFIKANTGRP", "VEGKATEGORI", "VEGNUMMER", "Driftskontrakt", "KEY_DISS"]
+    arcpy.management.Dissolve(
+        in_features=in_fc,
+        out_feature_class=out_fc,
+        dissolve_field=dissolve_fields,
+        statistics_fields=None,
+        multi_part="MULTI_PART",
+        unsplit_lines="DISSOLVE_LINES",
+    )
+
+    # Legg på felt + join median
+    fields_tbl = {f.name for f in arcpy.ListFields(stats_tbl)}
+    median_field = "MEDIAN_Lengde_km" if "MEDIAN_Lengde_km" in fields_tbl else None
+    if not median_field:
+        raise RuntimeError(f"Fant ikke median-felt i {stats_tbl}. Felter: {sorted(fields_tbl)}")
+
+    fields_out = {f.name for f in arcpy.ListFields(out_fc)}
+    if "Lengde_km_median" not in fields_out:
+        arcpy.management.AddField(out_fc, "Lengde_km_median", "DOUBLE")
+
+    arcpy.management.JoinField(out_fc, "KEY_DISS", stats_tbl, "KEY_DISS", [median_field])
+    arcpy.management.CalculateField(out_fc, "Lengde_km_median", f"!{median_field}!", "PYTHON3")
+
+    # Kjøreloggfelter + domain + init status
+    legg_til_kjoreloggfelter(out_fc)
+    setup_domain(gdb)
+    init_status_ikke_malt(out_fc)
+
+    return out_fc
+
+
+# -------------------------
+# MAIN
+# -------------------------
+def main() -> None:
+    log("🚀 Kjørelogg 2026 – bygger FV vegnett + registreringsnett (median)")
+
+    os.makedirs(OUT_FOLDER, exist_ok=True)
+    create_gdb(OUT_GDB)
+    arcpy.env.workspace = OUT_GDB
+
+    session = create_session()
+
+    # Import driftskontrakt
+    drift_fc = importer_driftskontrakt(OUT_GDB)
+    log("✓ Driftskontrakt importert")
+
+    for tg in ("K", "G"):
+        log(f"\n=== Trafikantgruppe {tg} ===")
+
+        # MR
+        mr_fc = hent_vegnett_segmentert(
+            session,
+            OUT_GDB,
+            out_name=f"tmp_MR_{tg}",
+            fylke=MR_FYLKE,
+            vegsystemref=VEGSYSTEMREF_MR,
+            trafikantgruppe=tg,
+        )
+
+        # Vestland FV61 (Stad)
+        vl_fc = hent_vegnett_segmentert(
+            session,
+            OUT_GDB,
+            out_name=f"tmp_VL61_{tg}",
+            fylke=VL_FYLKE,
+            kommune=VL_KOMM,
+            vegsystemref=VEGSYSTEMREF_VL,
+            trafikantgruppe=tg,
+        )
+
+        # Merge detalj
+        base_fc = os.path.join(OUT_GDB, f"Vegnett_FV_{tg}")
+        if arcpy.Exists(base_fc):
+            arcpy.management.Delete(base_fc)
+        arcpy.management.Merge([mr_fc, vl_fc], base_fc)
+        arcpy.management.Delete(mr_fc)
+        arcpy.management.Delete(vl_fc)
+
+        # Felter + domain
+        legg_til_kjoreloggfelter(base_fc)
+        setup_domain(OUT_GDB)
+
+        # Join driftskontrakt + beregn + init status
+        base_fc = spatial_join_driftskontrakt(base_fc, drift_fc)
+        calc_driftskontrakt(base_fc)
+        beregn_lengde_km(base_fc)
+        init_status_ikke_malt(base_fc)
+
+        n = int(arcpy.management.GetCount(base_fc)[0])
+        log(f"✅ {os.path.basename(base_fc)}: {n} rader")
+
+        # Registreringsnett (propagering) – median
+        reg_fc = lag_regnett_med_median(OUT_GDB, base_fc, f"Regnett_FV_{tg}")
+        nr = int(arcpy.management.GetCount(reg_fc)[0])
+        log(f"✅ {os.path.basename(reg_fc)}: {nr} rader")
+
+    log("\n🎉 FERDIG")
+    log(OUT_GDB)
+    log("Lag:")
+    log("  - Vegnett_FV_K / Vegnett_FV_G (detalj)")
+    log("  - Regnett_FV_K / Regnett_FV_G (registrering, dissolve + median)")
+    log("Status_Måling er initialisert til 'IKKE MÅLT' for alle rader.")
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise SystemExit(130)
+    main()

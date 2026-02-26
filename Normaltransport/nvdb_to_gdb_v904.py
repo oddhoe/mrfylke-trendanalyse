@@ -687,15 +687,20 @@ def hent_hoydebegrensning(session: requests.Session, gdb: str) -> str:
     log("Henter høydebegrensning (591) med posisjon...")
 
     fields = [
-        ("NVDB_ID",        "LONG"),
-        ("SKILTET_HOYDE",  "DOUBLE"),
-        ("TYPE_HINDER",    "TEXT",   60),
-        ("HINDER_NAVN",    "TEXT",  120),
-        ("EIER",           "TEXT",   80),
-        ("MERKNAD",        "TEXT",  200),
-        ("GYLDIG_FRA",     "TEXT",   20),
-        ("GYLDIG_TIL",     "TEXT",   20),
-        ("ALLE_EG",        "TEXT", 2000),
+        ("NVDB_ID",          "LONG"),
+        ("SKILTET_HOYDE",    "DOUBLE"),
+        ("BEREGNET_HOYDE",   "DOUBLE"),   # ny
+        ("H_MIN_MIDT",       "DOUBLE"),   # ny — frihøyde midt i profil
+        ("H_MIN_VENSTRE",    "DOUBLE"),   # ny
+        ("H_MIN_HOYRE",      "DOUBLE"),   # ny
+        ("TYPE_HINDER",      "TEXT",   60),
+        ("HINDER_NAVN",      "TEXT",  120),
+        ("MAALEMETODE",      "TEXT",   60),  # ny
+        ("MAALEDATO",        "TEXT",   20),  # ny
+        ("MERKNAD",          "TEXT",  200),
+        ("GYLDIG_FRA",       "TEXT",   20),
+        ("GYLDIG_TIL",       "TEXT",   20),
+        ("ALLE_EG",          "TEXT", 2000),
     ]
     fc = create_fc(gdb, "Hoydebegrensning_591", "POINT", fields)
 
@@ -712,22 +717,30 @@ def hent_hoydebegrensning(session: requests.Session, gdb: str) -> str:
     cnt  = 0
     cols = [
         "SHAPE@", "VEGLENKESEKV_ID", "STARTPOS", "SLUTTPOS",
-        "NVDB_ID", "SKILTET_HOYDE", "TYPE_HINDER", "HINDER_NAVN",
-        "EIER", "MERKNAD", "GYLDIG_FRA", "GYLDIG_TIL", "ALLE_EG",
+        "NVDB_ID", "SKILTET_HOYDE", "BEREGNET_HOYDE",
+        "H_MIN_MIDT", "H_MIN_VENSTRE", "H_MIN_HOYRE",
+        "TYPE_HINDER", "HINDER_NAVN", "MAALEMETODE", "MAALEDATO",
+        "MERKNAD", "GYLDIG_FRA", "GYLDIG_TIL", "ALLE_EG",
     ]
 
     with arcpy.da.InsertCursor(fc, cols) as cur:
         for o in iter_paged(session, url, params, label="hoyde591"):
             eg    = o.get("egenskaper", []) or []
-            e_h   = pick_property(eg, ["skiltet høyde", "fri høyde", "frihøyde", "høyde"])
-            hoyde = parse_float_any(e_h.get("verdi")) if e_h else None
 
+            # Skiltet høyde — primær filterbetingelse
+            e_h   = pick_property(eg, ["skilta høyde", "skiltet høyde", "fri høyde", "frihøyde"])
+            hoyde = parse_float_any(e_h.get("verdi")) if e_h else None
             if hoyde is None:
                 continue
 
-            typ         = eg_verdi(eg, "type", "hinder")
+            beregnet    = parse_float_any(eg_verdi(eg, "beregnet høyde"))
+            h_midt      = parse_float_any(eg_verdi(eg, "h-min, midt", "midt"))
+            h_venstre   = parse_float_any(eg_verdi(eg, "h-min, venstre"))
+            h_hoyre     = parse_float_any(eg_verdi(eg, "h-min, høyre"))
+            typ         = eg_verdi(eg, "type hinder", "type")
             hinder_navn = eg_verdi(eg, "navn")
-            eier        = eg_verdi(eg, "eier")
+            maalemetode = eg_verdi(eg, "målemetode", "maalemetode")
+            maaledato   = eg_verdi(eg, "måledato", "maaledato")
             merknad     = eg_verdi(eg, "merknad")
 
             meta       = o.get("metadata") or {}
@@ -754,9 +767,14 @@ def hent_hoydebegrensning(session: requests.Session, gdb: str) -> str:
                     sluttpos,
                     int(o["id"]),
                     hoyde,
+                    beregnet,
+                    h_midt,
+                    h_venstre,
+                    h_hoyre,
                     typ,
                     hinder_navn,
-                    eier,
+                    maalemetode,
+                    maaledato,
                     merknad,
                     gyldig_fra,
                     gyldig_til,
@@ -766,7 +784,6 @@ def hent_hoydebegrensning(session: requests.Session, gdb: str) -> str:
 
     log(f"Høydebegrensning ferdig: {cnt} punkter")
     return fc
-
 
 # -------------------------
 # MAIN
